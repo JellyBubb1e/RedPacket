@@ -1,4 +1,4 @@
-name: Build Snapshots
+name: Build
 on:
   push:
     branches: [ "master" ]
