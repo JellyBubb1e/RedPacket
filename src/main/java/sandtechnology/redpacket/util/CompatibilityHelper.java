@@ -11,6 +11,7 @@ import sandtechnology.redpacket.RedPacketPlugin;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
@@ -18,13 +19,32 @@ import static org.bukkit.Bukkit.getServer;
 import static sandtechnology.redpacket.RedPacketPlugin.getInstance;
 
 public class CompatibilityHelper {
-    //NMS名： "org.bukkit.craftbukkit.v1_x_Rx"->{"org","bukkit","craftbukkit","v1_x_Rx"}->"v1_x_Rx"
-    private static final String nmsName = getServer().getClass().getPackage().getName().split("\\.")[3];
-    /*
-    基于NMS名的版本提取
-    v1_8_R1->8
-    */
-    private static final int version = Integer.parseInt(nmsName.split("_")[1]);
+    // 修复1：动态查找包含"v"前缀的NMS版本字段
+    private static final String nmsName;
+    static {
+        String[] packageParts = getServer().getClass().getPackage().getName().split("\\.");
+        Optional<String> versionPart = Arrays.stream(packageParts)
+                .filter(part -> part.startsWith("v"))
+                .findFirst();
+        if (!versionPart.isPresent()) {
+            throw new IllegalStateException("无法解析NMS版本，请确认服务器版本兼容性");
+        }
+        nmsName = versionPart.get();
+    }
+
+    // 修复2：添加版本解析容错
+    private static final int version;
+    static {
+        String[] versionParts = nmsName.split("_");
+        if (versionParts.length < 2) {
+            throw new IllegalStateException("无效的NMS版本格式: " + nmsName);
+        }
+        try {
+            version = Integer.parseInt(versionParts[1]);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("无法解析版本号: " + versionParts[1], e);
+        }
+    }
 
     private static Class<?> IChatBaseComponent;
     private static Class<?> chatSerializer;
@@ -43,7 +63,6 @@ public class CompatibilityHelper {
     private CompatibilityHelper() {
     }
 
-
     private static Class<?> getNMSClass(String name) throws ClassNotFoundException {
         return Class.forName("net.minecraft.server." + nmsName + "." + name);
     }
@@ -55,24 +74,41 @@ public class CompatibilityHelper {
         }
         try {
             if (version > 12) {
-                //1.12以上不需要NMS反射
                 return;
             }
+            // 修复3：添加空安全检查
             entityPlayer = getNMSClass("EntityPlayer");
             chatSerializer = getNMSClass("IChatBaseComponent$ChatSerializer");
             IChatBaseComponent = getNMSClass("IChatBaseComponent");
             PacketPlayOutTitle = getNMSClass("PacketPlayOutTitle");
             PlayerConnection = getNMSClass("PlayerConnection");
-            craftPlayer = Class.forName("org.bukkit.craftbukkit." + nmsName + "." + "entity.CraftPlayer");
+            craftPlayer = Class.forName("org.bukkit.craftbukkit." + nmsName + ".entity.CraftPlayer");
+
+            // 修复4：增强反射方法的健壮性
+            if (craftPlayer == null) {
+                throw new ClassNotFoundException("CraftPlayer class not found");
+            }
             getHandle = craftPlayer.getMethod("getHandle");
+
             sendMessage = entityPlayer.getMethod("sendMessage", IChatBaseComponent);
             toComponent = chatSerializer.getMethod("a", String.class);
             sendPacket = PlayerConnection.getMethod("sendPacket", getNMSClass("Packet"));
-            EnumTitleAction = Arrays.stream(PacketPlayOutTitle.getClasses()).filter(Class::isEnum).collect(Collectors.toList()).get(0);
+
+            // 修复5：处理可能缺失的枚举类型
+            Class<?>[] innerClasses = PacketPlayOutTitle.getClasses();
+            Optional<Class<?>> enumClass = Arrays.stream(innerClasses)
+                    .filter(Class::isEnum)
+                    .findFirst();
+            if (!enumClass.isPresent()) {
+                throw new RuntimeException("PacketPlayOutTitle中未找到枚举类型");
+            }
+            EnumTitleAction = enumClass.get();
             EnumTitleActions = (Enum<? extends Enum>[]) EnumTitleAction.getEnumConstants();
+
             CPacketPlayOutTitle = PacketPlayOutTitle.getConstructor(EnumTitleAction, IChatBaseComponent);
         } catch (Exception e) {
             e.printStackTrace();
+            throw new RuntimeException("插件兼容层初始化失败", e);
         }
     }
 
@@ -144,7 +180,6 @@ public class CompatibilityHelper {
             player.spigot().sendMessage(components);
         } else {
             if (version >= 7) {
-                //https://www.spigotmc.org/threads/get-player-ping-with-reflection.147773/
                 //反射需要较长时间，采取异步处理再发送消息
                 Bukkit.getScheduler().runTaskAsynchronously(getInstance(), () -> {
                     Object playerInstance = invoke(getHandle, player);
@@ -154,5 +189,4 @@ public class CompatibilityHelper {
             }
         }
     }
-
 }
