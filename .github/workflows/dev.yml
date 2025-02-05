@@ -27,7 +27,7 @@ jobs:
       - name: Get short SHA
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
       - name: Build Plugin
-        uses: gradle/gradle-build-action@v4
+        uses: gradle/gradle-build-action@v3
         with:
           arguments: build
       - name: Upload Artifacts
