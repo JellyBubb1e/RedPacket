@@ -19,7 +19,11 @@ import static org.bukkit.Bukkit.getServer;
 import static sandtechnology.redpacket.RedPacketPlugin.getInstance;
 
 public class CompatibilityHelper {
-    // 修复1：动态查找包含"v"前缀的NMS版本字段
+    // ========================== 核心兼容层 ==========================
+    // 修复1：动态获取 CraftBukkit 包路径（适配1.20.5+）
+    private static final String CRAFTBUKKIT_PACKAGE = Bukkit.getServer().getClass().getPackage().getName();
+
+    // 修复2：动态解析NMS版本（兼容旧版）
     private static final String nmsName;
     static {
         String[] packageParts = getServer().getClass().getPackage().getName().split("\\.");
@@ -27,25 +31,31 @@ public class CompatibilityHelper {
                 .filter(part -> part.startsWith("v"))
                 .findFirst();
         if (!versionPart.isPresent()) {
-            throw new IllegalStateException("无法解析NMS版本，请确认服务器版本兼容性");
+            // 1.20.5+ 没有版本号，尝试从Bukkit版本推导
+            String bukkitVersion = Bukkit.getBukkitVersion().split("-")[0];
+            String[] versionSegments = bukkitVersion.split("\\.");
+            int minorVer = Integer.parseInt(versionSegments[1]);
+            nmsName = "v1_%d_R3".formatted(minorVer); // 示例：1.20.5 -> v1_20_R3
+        } else {
+            nmsName = versionPart.get();
         }
-        nmsName = versionPart.get();
     }
 
-    // 修复2：添加版本解析容错
+    // 修复3：增强版版本号解析
     private static final int version;
     static {
         String[] versionParts = nmsName.split("_");
         if (versionParts.length < 2) {
-            throw new IllegalStateException("无效的NMS版本格式: " + nmsName);
+            throw new IllegalStateException("Invalid NMS version format: " + nmsName);
         }
         try {
             version = Integer.parseInt(versionParts[1]);
         } catch (NumberFormatException e) {
-            throw new IllegalStateException("无法解析版本号: " + versionParts[1], e);
+            throw new IllegalStateException("Failed to parse version: " + versionParts[1], e);
         }
     }
 
+    // ========================== NMS反射相关 ==========================
     private static Class<?> IChatBaseComponent;
     private static Class<?> chatSerializer;
     private static Class<?> craftPlayer;
@@ -60,133 +70,162 @@ public class CompatibilityHelper {
     private static Method sendPacket;
     private static Constructor<?> CPacketPlayOutTitle;
 
-    private CompatibilityHelper() {
+    // ========================== 工具方法 ==========================
+    /**
+     * 动态获取CraftBukkit类（适配1.20.5+包结构）
+     */
+    private static Class<?> getCraftBukkitClass(String className) throws ClassNotFoundException {
+        return Class.forName(CRAFTBUKKIT_PACKAGE + "." + className);
     }
 
-    private static Class<?> getNMSClass(String name) throws ClassNotFoundException {
-        return Class.forName("net.minecraft.server." + nmsName + "." + name);
+    /**
+     * 动态获取NMS类（兼容旧版）
+     */
+    private static Class<?> getNMSClass(String className) throws ClassNotFoundException {
+        return Class.forName("net.minecraft.server." + nmsName + "." + className);
     }
 
+    // ========================== 初始化方法 ==========================
     public static void setup() {
         if (version <= 7) {
             RedPacketPlugin.log(Level.SEVERE, "插件只支持1.8+版本！");
-            throw new IllegalStateException("插件只支持1.8+版本！");
+            throw new IllegalStateException("Unsupported version: 1." + version);
         }
+
         try {
             if (version > 12) {
-                return;
+                return; // 高版本使用原生API
             }
-            // 修复3：添加空安全检查
+
+            // 初始化NMS类
             entityPlayer = getNMSClass("EntityPlayer");
             chatSerializer = getNMSClass("IChatBaseComponent$ChatSerializer");
             IChatBaseComponent = getNMSClass("IChatBaseComponent");
             PacketPlayOutTitle = getNMSClass("PacketPlayOutTitle");
             PlayerConnection = getNMSClass("PlayerConnection");
-            craftPlayer = Class.forName("org.bukkit.craftbukkit." + nmsName + ".entity.CraftPlayer");
 
-            // 修复4：增强反射方法的健壮性
+            // 初始化CraftBukkit类（适配新包结构）
+            craftPlayer = getCraftBukkitClass("entity.CraftPlayer");
             if (craftPlayer == null) {
                 throw new ClassNotFoundException("CraftPlayer class not found");
             }
-            getHandle = craftPlayer.getMethod("getHandle");
 
+            // 获取核心方法
+            getHandle = craftPlayer.getMethod("getHandle");
             sendMessage = entityPlayer.getMethod("sendMessage", IChatBaseComponent);
             toComponent = chatSerializer.getMethod("a", String.class);
             sendPacket = PlayerConnection.getMethod("sendPacket", getNMSClass("Packet"));
 
-            // 修复5：处理可能缺失的枚举类型
+            // 初始化标题枚举
             Class<?>[] innerClasses = PacketPlayOutTitle.getClasses();
             Optional<Class<?>> enumClass = Arrays.stream(innerClasses)
                     .filter(Class::isEnum)
                     .findFirst();
             if (!enumClass.isPresent()) {
-                throw new RuntimeException("PacketPlayOutTitle中未找到枚举类型");
+                throw new RuntimeException("Missing EnumTitleAction in PacketPlayOutTitle");
             }
             EnumTitleAction = enumClass.get();
             EnumTitleActions = (Enum<? extends Enum>[]) EnumTitleAction.getEnumConstants();
 
-            CPacketPlayOutTitle = PacketPlayOutTitle.getConstructor(EnumTitleAction, IChatBaseComponent);
+            // 构造标题包
+            CPacketPlayOutTitle = PacketPlayOutTitle.getConstructor(
+                    EnumTitleAction, 
+                    IChatBaseComponent
+            );
         } catch (Exception e) {
-            e.printStackTrace();
-            throw new RuntimeException("插件兼容层初始化失败", e);
+            throw new RuntimeException("Compatibility layer initialization failed", e);
         }
     }
 
-    private static Object invoke(Method method, Object obj, Object... objs) {
+    // ========================== 功能方法 ==========================
+    private static Object invoke(Method method, Object obj, Object... args) {
         try {
-            return method.invoke(obj, objs);
+            return method.invoke(obj, args);
         } catch (Exception e) {
-            throw new RuntimeException("在反射调用方法时发生错误！" + method.getName(), e);
+            throw new RuntimeException("反射调用失败: " + method.getName(), e);
         }
     }
 
-    private static Object newInstance(Constructor constructor, Object... objs) {
+    private static Object newInstance(Constructor<?> constructor, Object... args) {
         try {
-            return constructor.newInstance(objs);
+            return constructor.newInstance(args);
         } catch (Exception e) {
-            throw new RuntimeException("在反射实例化类时发生错误！类名：", e);
+            throw new RuntimeException("反射实例化失败: " + constructor.getDeclaringClass().getName(), e);
         }
     }
 
+    // -------------------------- 音效相关 --------------------------
     public static void playLevelUpSound(Player player) {
-        if (version > 8) {
-            playSound(player, "ENTITY_PLAYER_LEVELUP");
-        } else {
-            playSound(player, "LEVEL_UP");
-        }
+        playSound(player, version > 8 ? "ENTITY_PLAYER_LEVELUP" : "LEVEL_UP");
     }
 
     public static void playMeowSound(Player player) {
-        if (version > 8) {
-            playSound(player, "ENTITY_CAT_AMBIENT");
-        } else {
-            playSound(player, "CAT_MEOW");
-        }
+        playSound(player, version > 8 ? "ENTITY_CAT_AMBIENT" : "CAT_MEOW");
     }
 
-    private static void playSound(Player player, String name) {
-        player.playSound(player.getLocation(), Sound.valueOf(name), 100, 1);
-    }
-
-    private static Object getDeclaredFieldAndGetIt(Class<?> target, String field, Object instance) {
+    private static void playSound(Player player, String soundName) {
         try {
-            return target.getDeclaredField(field).get(instance);
-        } catch (Exception e) {
-            throw new RuntimeException("在反射获取字段时发生错误！方法名：", e);
+            player.playSound(player.getLocation(), Sound.valueOf(soundName), 100, 1);
+        } catch (IllegalArgumentException e) {
+            RedPacketPlugin.log(Level.WARNING, "未知音效名称: " + soundName);
         }
     }
 
+    // -------------------------- 标题相关 --------------------------
     public static void sendTitle(Player player, String title, String subtitle) {
         if (version >= 11) {
             player.sendTitle(title, subtitle, -1, -1, -1);
-        } else {
-            if (version >= 8) {
-                //反射需要较长时间，采取异步处理再发送消息
-                Bukkit.getScheduler().runTaskAsynchronously(getInstance(), () -> {
-                    Object connectionInstance = getDeclaredFieldAndGetIt(entityPlayer, "playerConnection", invoke(getHandle, player));
-                    Object titlePacket = newInstance(CPacketPlayOutTitle, EnumTitleActions[0], invoke(toComponent, null, ComponentSerializer.toString(new TextComponent(title))));
-                    Object subtitlePacket = newInstance(CPacketPlayOutTitle, EnumTitleActions[1], invoke(toComponent, null, ComponentSerializer.toString(new TextComponent(subtitle))));
+            return;
+        }
+
+        if (version >= 8) {
+            Bukkit.getScheduler().runTaskAsynchronously(getInstance(), () -> {
+                try {
+                    Object handle = invoke(getHandle, player);
+                    Object connection = entityPlayer.getField("playerConnection").get(handle);
+                    
+                    Object titleComponent = invoke(toComponent, null, 
+                        ComponentSerializer.toString(new TextComponent(title)));
+                    Object subtitleComponent = invoke(toComponent, null, 
+                        ComponentSerializer.toString(new TextComponent(subtitle)));
+
+                    Object titlePacket = newInstance(CPacketPlayOutTitle, 
+                        EnumTitleActions[0], titleComponent);
+                    Object subtitlePacket = newInstance(CPacketPlayOutTitle, 
+                        EnumTitleActions[1], subtitleComponent);
+
                     Bukkit.getScheduler().runTask(getInstance(), () -> {
-                        invoke(sendPacket, connectionInstance, titlePacket);
-                        invoke(sendPacket, connectionInstance, subtitlePacket);
+                        invoke(sendPacket, connection, titlePacket);
+                        invoke(sendPacket, connection, subtitlePacket);
                     });
-                });
-            }
+                } catch (Exception e) {
+                    RedPacketPlugin.log(Level.SEVERE, "发送标题时发生错误: " + e.getMessage());
+                }
+            });
         }
     }
 
+    // -------------------------- JSON消息 --------------------------
     public static void sendJSONMessage(Player player, BaseComponent... components) {
         if (version >= 12) {
             player.spigot().sendMessage(components);
-        } else {
-            if (version >= 7) {
-                //反射需要较长时间，采取异步处理再发送消息
-                Bukkit.getScheduler().runTaskAsynchronously(getInstance(), () -> {
-                    Object playerInstance = invoke(getHandle, player);
-                    Object JSONString = invoke(toComponent, null, ComponentSerializer.toString(components));
-                    Bukkit.getScheduler().runTask(getInstance(), () -> invoke(sendMessage, playerInstance, JSONString));
-                });
-            }
+            return;
+        }
+
+        if (version >= 7) {
+            Bukkit.getScheduler().runTaskAsynchronously(getInstance(), () -> {
+                try {
+                    Object handle = invoke(getHandle, player);
+                    String json = ComponentSerializer.toString(components);
+                    Object component = invoke(toComponent, null, json);
+
+                    Bukkit.getScheduler().runTask(getInstance(), () -> {
+                        invoke(sendMessage, handle, component);
+                    });
+                } catch (Exception e) {
+                    RedPacketPlugin.log(Level.SEVERE, "发送JSON消息时发生错误: " + e.getMessage());
+                }
+            });
         }
     }
 }
