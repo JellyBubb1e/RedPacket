@@ -35,7 +35,7 @@ public class CompatibilityHelper {
             String bukkitVersion = Bukkit.getBukkitVersion().split("-")[0];
             String[] versionSegments = bukkitVersion.split("\\.");
             int minorVer = Integer.parseInt(versionSegments[1]);
-            nmsName = "v1_%d_R3".formatted(minorVer); // 示例：1.20.5 -> v1_20_R3
+            nmsName = String.format("v1_%d_R3", minorVer); // 示例：1.20.5 -> v1_20_R3
         } else {
             nmsName = versionPart.get();
         }
